@@ -27,6 +27,11 @@ def download(url: str, output_dir: str = "downloads") -> None:
         "merge_output_format": "mp4",
         "noplaylist": True,
         "progress_hooks": [progress_hook],
+        "retries": 10,
+        "fragment_retries": 10,
+        # HTTP 403対策: 通常のwebクライアントがブロックされる場合に備え、
+        # androidクライアントのAPIを併用してフォールバックする
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
