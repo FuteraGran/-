@@ -302,9 +302,15 @@ class ChatCounter:
     誤って読み捨てないようにする。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, start_usec: int) -> None:
+        # 配信中（videoOffsetTimeMsecが無い）コメントの経過時間は、
+        # このスクリプトを起動した瞬間（起動時刻）を0分の基準にして
+        # 計算する。YouTubeの仕様上、配信中に接続した場合は配信
+        # 開始時点からの完全な履歴は取得できず、接続直後に直近の
+        # 既存コメント（バックログ）がまとめて届くことがあるため、
+        # それらは基準より前＝マイナスの分として扱う。
+        self._start_usec = start_usec
         self._read_offset = 0
-        self._baseline_usec: int | None = None
         self.all_counts: Counter[int] = Counter()
         self.laugh_counts: Counter[int] = Counter()
         self.cute_counts: Counter[int] = Counter()
@@ -377,15 +383,22 @@ class ChatCounter:
             # 経過時間を判定できないコメントは集計から除外する。
             return None
 
-        if self._baseline_usec is None:
-            # 配信中は動画内経過時間が無いため、この取得中に見えた
-            # 最初のコメントの投稿時刻を基準（0分）にする。
-            self._baseline_usec = timestamp_usec
+        # timestampUsecはUNIX時刻（マイクロ秒）なので、起動時刻との
+        # 差分をそのまま分単位に丸める。起動前に投稿されたバックログ
+        # コメントは差分が負になり、マイナスの分として扱われる。
+        return (timestamp_usec - self._start_usec) // 60_000_000
 
-        return max(
-            0,
-            (timestamp_usec - self._baseline_usec) // 60_000_000,
-        )
+
+def format_minute_hhmm(minute: int) -> str:
+    """分（負の値も可）をH:MM形式に変換する。
+
+    0分＝起動時刻。負の値は起動前に届いたバックログコメントを表し、
+    "-"を付けて表示する。
+    """
+    sign = "-" if minute < 0 else ""
+    hours, mins = divmod(abs(minute), 60)
+
+    return f"{sign}{hours}:{mins:02d}"
 
 
 def write_csv(
@@ -415,13 +428,11 @@ def write_csv(
             ]
         )
 
-        for minute in range(max(all_counts) + 1):
-            hours, mins = divmod(minute, 60)
-
+        for minute in range(min(all_counts), max(all_counts) + 1):
             writer.writerow(
                 [
                     minute,
-                    f"{hours:02d}:{mins:02d}:00",
+                    f"{format_minute_hhmm(minute)}:00",
                     all_counts[minute],
                     laugh_counts[minute],
                     cute_counts[minute],
@@ -434,13 +445,7 @@ def format_elapsed_time(
     _position: int,
 ) -> str:
     """グラフの横軸をH:MM形式に変換する。"""
-    minute = max(
-        0,
-        int(round(value)),
-    )
-    hours, mins = divmod(minute, 60)
-
-    return f"{hours}:{mins:02d}"
+    return format_minute_hhmm(int(round(value)))
 
 
 class LiveGraph:
@@ -485,8 +490,18 @@ class LiveGraph:
             label='Comments containing "かわいい" or "可愛い"',
         )
 
+        # 起動時刻（0分）を示す縦線。マイナス側はバックログコメント。
+        self.ax.axvline(
+            0,
+            color="#888888",
+            linestyle="--",
+            linewidth=1,
+            alpha=0.7,
+            label="Script start (0:00)",
+        )
+
         self.ax.set_ylabel("Comments")
-        self.ax.set_xlabel("Elapsed time (H:MM)")
+        self.ax.set_xlabel("Elapsed time (H:MM, 0:00 = script start)")
         self.ax.xaxis.set_major_formatter(
             FuncFormatter(format_elapsed_time)
         )
@@ -528,8 +543,9 @@ class LiveGraph:
         if self.closed or not all_counts:
             return
 
+        first_minute = min(all_counts)
         last_minute = max(all_counts)
-        minutes = list(range(last_minute + 1))
+        minutes = list(range(first_minute, last_minute + 1))
 
         self.all_line.set_data(
             minutes,
@@ -545,7 +561,10 @@ class LiveGraph:
         )
 
         self._set_title(status)
-        self.ax.set_xlim(0, max(1, last_minute))
+        self.ax.set_xlim(
+            min(0, first_minute),
+            max(1, last_minute),
+        )
 
         # データがどんなに小さくても軸が潰れて見えなくならない
         # よう、最大値に余白を持たせつつ最低限の高さを確保する。
@@ -564,7 +583,7 @@ class LiveGraph:
 
         # 軸が実際に更新されているか目視確認できるようデバッグ出力。
         print(
-            f"[debug] x範囲=0〜{last_minute} "
+            f"[debug] x範囲={first_minute}〜{last_minute} "
             f"y範囲={self.ax.get_ylim()} "
             f"最大値(all/laugh/cute)="
             f"{max(all_counts.values())}/"
@@ -618,11 +637,15 @@ def wait_for_next_update(
 
 
 def run(video_id: str, directory: Path) -> None:
+    # 「コード起動時」を0分の基準として使うため、yt-dlpを起動する
+    # 直前の時刻を記録しておく。
+    start_usec = int(time.time() * 1_000_000)
+
     process = start_live_chat_capture(video_id, directory)
     chat_path: Path | None = None
 
     graph = LiveGraph(video_id)
-    counter = ChatCounter()
+    counter = ChatCounter(start_usec)
 
     try:
         chat_path = wait_for_chat_file(
