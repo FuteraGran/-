@@ -745,20 +745,28 @@ def run(
 
     process = start_live_chat_capture(video_id, directory)
     chat_path: Path | None = None
-
     video_processes: tuple[subprocess.Popen, subprocess.Popen] | None = None
 
-    if video_output_dir is not None:
-        video_processes = start_video_segment_capture(
-            video_id, video_output_dir, VIDEO_SEGMENT_SECONDS
-        )
-        print(f"映像の保存先: {video_output_dir.resolve()}")
-
+    # 映像保存の準備に失敗しても、グラフ自体は必ず表示されるように
+    # 先にウィンドウを作ってしまう。
     graph = LiveGraph(video_id)
     counter = ChatCounter(start_usec)
     video_capture_warned = False
 
     try:
+        if video_output_dir is not None:
+            try:
+                video_processes = start_video_segment_capture(
+                    video_id, video_output_dir, VIDEO_SEGMENT_SECONDS
+                )
+                print(f"映像の保存先: {video_output_dir.resolve()}")
+            except (OSError, subprocess.SubprocessError) as error:
+                print(
+                    f"[警告] 映像の保存を開始できませんでした: {error}\n"
+                    "チャットの集計・グラフ表示は続行します。",
+                    file=sys.stderr,
+                )
+
         chat_path = wait_for_chat_file(
             video_id, directory, process
         )
