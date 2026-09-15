@@ -13,14 +13,21 @@
 閉じるまで）。すでに終わったアーカイブの場合は、チャット
 リプレイを取得し終えた時点でグラフが確定する。
 
+任意で、配信映像そのものも録画できる。録画を有効にすると、
+配信を継続的に取得しながら、指定フォルダへ10分（既定値）ごとの
+動画ファイルとして自動的に切り分けて保存し続ける。
+
 初回のみ:
     py -m pip install -U yt-dlp matplotlib
+    映像を録画する場合はffmpegも必要（https://ffmpeg.org/ からインストール）。
 
 実行方法:
     VS Codeの実行ボタンを押し、動画IDまたはURLを入力する。
     配信中の動画URLでもアーカイブのURLでもどちらでも良い。
+    映像の保存先フォルダを聞かれたら、保存したい場合はパスを、
+    不要ならそのままEnterを押す。
 
-APIキーは不要。動画本体はダウンロードしない。
+APIキーは不要。
 Ctrl+Cまたはグラフウィンドウを閉じるといつでも終了できる。
 """
 
@@ -29,6 +36,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,6 +70,9 @@ CLOSE_CHECK_INTERVAL_SECONDS = 0.5
 # 「w」を笑いの意味とみなす際、英字に挟まれた"w"（wow, when, with, …）を
 # 誤検出しないための正規表現。英字が前後に無い"w"/"W"の連続だけを拾う。
 _LAUGH_PATTERN = re.compile(r"(?<![A-Za-z])[wW]+(?![A-Za-z])")
+
+# 映像を保存する場合、1本のファイルに区切る長さ（秒）。
+VIDEO_SEGMENT_SECONDS = 600.0
 
 
 def extract_video_id(value: str) -> str:
@@ -137,6 +148,93 @@ def start_live_chat_capture(
     ]
 
     return subprocess.Popen(command)
+
+
+def find_ffmpeg() -> str:
+    """ffmpeg実行ファイルのパスを返す。見つからなければエラーにする。"""
+    ffmpeg_path = shutil.which("ffmpeg")
+
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            "ffmpegが見つかりません。映像の保存にはffmpegが必要です。"
+            "https://ffmpeg.org/ からインストールしてください。"
+        )
+
+    return ffmpeg_path
+
+
+def start_video_segment_capture(
+    video_id: str,
+    output_dir: Path,
+    segment_seconds: float,
+) -> tuple[subprocess.Popen, subprocess.Popen]:
+    """配信映像を継続的にダウンロードしながら、指定秒数ごとに
+    別ファイルへ自動的に切り分けて保存し続ける。
+
+    「10分ごとに10分間だけダウンロードし直す」方式だと、開始の
+    たびに配信情報の取得や接続待ちが発生し、そのわずかな時間の
+    映像が毎回欠けてしまう。そのためyt-dlpでは配信全体を1本の
+    連続したストリームとして取得し続け、その場でffmpegに渡して
+    セグメント単位のファイルへ切り分ける方式にしている。
+    """
+    ffmpeg_path = find_ffmpeg()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    yt_dlp_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "-f",
+            "best",
+            "-o",
+            "-",
+            f"https://www.youtube.com/watch?v={video_id}",
+        ],
+        stdout=subprocess.PIPE,
+    )
+
+    ffmpeg_process = subprocess.Popen(
+        [
+            ffmpeg_path,
+            "-loglevel",
+            "warning",
+            "-i",
+            "pipe:0",
+            "-c",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(segment_seconds),
+            "-reset_timestamps",
+            "1",
+            "-strftime",
+            "1",
+            str(output_dir / "video_%Y%m%d_%H%M%S.mp4"),
+        ],
+        stdin=yt_dlp_process.stdout,
+    )
+
+    # 読み手はffmpeg側に渡したので、親プロセス側の参照は閉じておく
+    # （ffmpegが終了した際にyt-dlp側もSIGPIPEで正しく終了できる）。
+    if yt_dlp_process.stdout is not None:
+        yt_dlp_process.stdout.close()
+
+    return yt_dlp_process, ffmpeg_process
+
+
+def stop_process(process: subprocess.Popen) -> None:
+    """プロセスを止める（終了済みなら何もしない）。"""
+    if process.poll() is not None:
+        return
+
+    process.terminate()
+
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
 
 
 def wait_for_chat_file(
@@ -636,7 +734,11 @@ def wait_for_next_update(
         plt.pause(CLOSE_CHECK_INTERVAL_SECONDS)
 
 
-def run(video_id: str, directory: Path) -> None:
+def run(
+    video_id: str,
+    directory: Path,
+    video_output_dir: Path | None = None,
+) -> None:
     # 「コード起動時」を0分の基準として使うため、yt-dlpを起動する
     # 直前の時刻を記録しておく。
     start_usec = int(time.time() * 1_000_000)
@@ -644,8 +746,17 @@ def run(video_id: str, directory: Path) -> None:
     process = start_live_chat_capture(video_id, directory)
     chat_path: Path | None = None
 
+    video_processes: tuple[subprocess.Popen, subprocess.Popen] | None = None
+
+    if video_output_dir is not None:
+        video_processes = start_video_segment_capture(
+            video_id, video_output_dir, VIDEO_SEGMENT_SECONDS
+        )
+        print(f"映像の保存先: {video_output_dir.resolve()}")
+
     graph = LiveGraph(video_id)
     counter = ChatCounter(start_usec)
+    video_capture_warned = False
 
     try:
         chat_path = wait_for_chat_file(
@@ -653,6 +764,19 @@ def run(video_id: str, directory: Path) -> None:
         )
 
         while True:
+            if (
+                video_processes is not None
+                and not video_capture_warned
+                and any(p.poll() is not None for p in video_processes)
+            ):
+                video_capture_warned = True
+                print()
+                print(
+                    "[警告] 映像の保存プロセスが停止しました。"
+                    "チャットの集計は継続します。",
+                    file=sys.stderr,
+                )
+
             counter.update(chat_path)
 
             finished = process.poll() is not None
@@ -712,13 +836,13 @@ def run(video_id: str, directory: Path) -> None:
             graph.wait_final()
 
     finally:
-        if process.poll() is None:
-            process.terminate()
+        stop_process(process)
 
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+        if video_processes is not None:
+            # ffmpeg（書き込み側）を先に止め、その後にyt-dlp
+            # （パイプの送り側）を止める。
+            for video_process in reversed(video_processes):
+                stop_process(video_process)
 
 
 def main() -> int:
@@ -727,15 +851,26 @@ def main() -> int:
         "配信中またはアーカイブの動画IDかURLを入力してください: "
     ).strip()
 
+    video_output_value = input(
+        "映像も保存する場合は保存先フォルダを入力"
+        "（不要な場合は空欄でEnter）: "
+    ).strip()
+    video_output_dir = (
+        Path(video_output_value) if video_output_value else None
+    )
+
     try:
         video_id = extract_video_id(value)
+
+        if video_output_dir is not None:
+            find_ffmpeg()
 
         print(f"matplotlibバックエンド: {plt.get_backend()}")
 
         with tempfile.TemporaryDirectory(
             prefix="youtube_chat_"
         ) as temp:
-            run(video_id, Path(temp))
+            run(video_id, Path(temp), video_output_dir)
 
     except KeyboardInterrupt:
         print("\n中断しました。")
