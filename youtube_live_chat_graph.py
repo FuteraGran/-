@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""YouTubeのライブチャット（配信中/アーカイブ）を1分ごとに集計し、
-グラフをリアルタイムで更新し続ける。
+"""YouTube / Twitch配信アーカイブのチャットリプレイを1分ごとに集計する。
 
 以下のコメント数を別々の色でグラフに表示する。
 
@@ -8,27 +7,15 @@
 ・「w」「笑」「草」のいずれかを含むコメント
 ・「かわいい」「可愛い」のいずれかを含むコメント
 
-配信中に起動した場合は、新しいコメントが届くたびに
-グラフが自動で更新され続ける（配信が終わるかウィンドウを
-閉じるまで）。すでに終わったアーカイブの場合は、チャット
-リプレイを取得し終えた時点でグラフが確定する。
-
-任意で、配信映像そのものも録画できる。録画を有効にすると、
-配信を継続的に取得しながら、指定フォルダへ10分（既定値）ごとの
-動画ファイルとして自動的に切り分けて保存し続ける。
-
 初回のみ:
-    py -m pip install -U yt-dlp matplotlib
-    映像を録画する場合はffmpegも必要（https://ffmpeg.org/ からインストール）。
+    py -m pip install -U yt-dlp chat-downloader matplotlib
 
 実行方法:
-    VS Codeの実行ボタンを押し、動画IDまたはURLを入力する。
-    配信中の動画URLでもアーカイブのURLでもどちらでも良い。
-    映像の保存先フォルダを聞かれたら、保存したい場合はパスを、
-    不要ならそのままEnterを押す。
+    VS Codeの実行ボタンを押し、
+    YouTubeまたはTwitchのアーカイブURL（もしくは動画ID）を入力する。
 
-APIキーは不要。
-Ctrl+Cまたはグラフウィンドウを閉じるといつでも終了できる。
+APIキーは不要。動画本体はダウンロードしない。
+YouTubeはyt-dlp、Twitchはchat-downloaderでチャットのみ取得する。
 """
 
 from __future__ import annotations
@@ -36,43 +23,51 @@ from __future__ import annotations
 import csv
 import json
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from collections import Counter
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 try:
     import matplotlib.pyplot as plt
-    from matplotlib.ticker import FuncFormatter, MaxNLocator
+    from matplotlib.ticker import FuncFormatter
 except ModuleNotFoundError:
     print("matplotlibがありません。次を実行してください:")
-    print("py -m pip install -U matplotlib yt-dlp")
+    print("py -m pip install -U matplotlib yt-dlp chat-downloader")
     raise SystemExit(1)
 
 
 CSV_PATH = Path("comment_counts.csv")
 
-# グラフを更新する間隔（秒）。短くしすぎると重くなるので注意。
-UPDATE_INTERVAL_SECONDS = 60.0
 
-# チャットファイルが出現するまでの最大待ち時間（秒）。
-FILE_APPEAR_TIMEOUT_SECONDS = 60.0
+def detect_platform(value: str) -> str:
+    """入力値がYouTubeかTwitchかを判定する。"""
+    stripped = value.strip()
 
-# ウィンドウを閉じた／配信が終わったことにどれだけ早く気づけるかの
-# ポーリング間隔（秒）。UPDATE_INTERVAL_SECONDSより十分短くすることで、
-# 「グラフを閉じたら即終了する」を実際に成立させる。
-CLOSE_CHECK_INTERVAL_SECONDS = 0.5
+    # TwitchのVOD IDは数字のみのため、YouTube ID判定より先に確認する。
+    if re.fullmatch(r"\d+", stripped):
+        return "twitch"
 
-# 「w」を笑いの意味とみなす際、英字に挟まれた"w"（wow, when, with, …）を
-# 誤検出しないための正規表現。英字が前後に無い"w"/"W"の連続だけを拾う。
-_LAUGH_PATTERN = re.compile(r"(?<![A-Za-z])[wW]+(?![A-Za-z])")
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", stripped):
+        return "youtube"
 
-# 映像を保存する場合、1本のファイルに区切る長さ（秒）。
-VIDEO_SEGMENT_SECONDS = 600.0
+    parsed = urlparse(
+        stripped if "://" in stripped else f"https://{stripped}"
+    )
+    host = parsed.netloc.lower().split(":", 1)[0]
+
+    if "twitch.tv" in host:
+        return "twitch"
+
+    if "youtu" in host:
+        return "youtube"
+
+    raise ValueError(
+        "YouTubeまたはTwitchのアーカイブURL、"
+        "もしくは動画IDを入力してください。"
+    )
 
 
 def extract_video_id(value: str) -> str:
@@ -88,7 +83,7 @@ def extract_video_id(value: str) -> str:
     host = parsed.netloc.lower().split(":", 1)[0]
     candidate = ""
 
-    if host in {"youtu.be", "www.youtu.be"}:
+    if host in {"youtu.be", "[www.youtu.be](https://www.youtu.be)"}:
         candidate = parsed.path.strip("/").split("/", 1)[0]
 
     elif host.endswith("youtube.com"):
@@ -122,17 +117,42 @@ def extract_video_id(value: str) -> str:
     return candidate
 
 
-def start_live_chat_capture(
+def extract_twitch_vod_id(value: str) -> str:
+    """URLまたは数字の文字列からTwitchのVOD IDを取得する。"""
+    value = value.strip()
+
+    if re.fullmatch(r"\d+", value):
+        return value
+
+    parsed = urlparse(
+        value if "://" in value else f"https://{value}"
+    )
+
+    match = re.search(
+        r"/(?:v(?:ideo)?|videos)/(\d+)",
+        parsed.path,
+    )
+
+    if not match:
+        match = re.search(
+            r"[?&]video=v?(\d+)",
+            parsed.query,
+        )
+
+    if not match:
+        raise ValueError(
+            "TwitchのアーカイブURLまたは"
+            "動画IDを入力してください。"
+        )
+
+    return match.group(1)
+
+
+def download_live_chat(
     video_id: str,
     directory: Path,
-) -> subprocess.Popen:
-    """yt-dlpをバックグラウンドで起動し、チャットを取得し続ける。
-
-    配信中の動画であれば、yt-dlpは配信が終わるまでプロセスを
-    終了せず、新しいコメントが届くたびにファイルへ追記し続ける。
-    すでに終わったアーカイブであれば、すぐに取得し終えて
-    プロセスは終了する。
-    """
+) -> Path:
+    """yt-dlpを使ってYouTubeのチャットリプレイだけを取得する。"""
     command = [
         sys.executable,
         "-m",
@@ -147,127 +167,37 @@ def start_live_chat_capture(
         f"https://www.youtube.com/watch?v={video_id}",
     ]
 
-    return subprocess.Popen(command)
-
-
-def find_ffmpeg() -> str:
-    """ffmpeg実行ファイルのパスを返す。見つからなければエラーにする。"""
-    ffmpeg_path = shutil.which("ffmpeg")
-
-    if ffmpeg_path is None:
-        raise RuntimeError(
-            "ffmpegが見つかりません。映像の保存にはffmpegが必要です。"
-            "https://ffmpeg.org/ からインストールしてください。"
-        )
-
-    return ffmpeg_path
-
-
-def start_video_segment_capture(
-    video_id: str,
-    output_dir: Path,
-    segment_seconds: float,
-) -> tuple[subprocess.Popen, subprocess.Popen]:
-    """配信映像を継続的にダウンロードしながら、指定秒数ごとに
-    別ファイルへ自動的に切り分けて保存し続ける。
-
-    「10分ごとに10分間だけダウンロードし直す」方式だと、開始の
-    たびに配信情報の取得や接続待ちが発生し、そのわずかな時間の
-    映像が毎回欠けてしまう。そのためyt-dlpでは配信全体を1本の
-    連続したストリームとして取得し続け、その場でffmpegに渡して
-    セグメント単位のファイルへ切り分ける方式にしている。
-    """
-    ffmpeg_path = find_ffmpeg()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    yt_dlp_process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "yt_dlp",
-            "-f",
-            "best",
-            "-o",
-            "-",
-            f"https://www.youtube.com/watch?v={video_id}",
-        ],
-        stdout=subprocess.PIPE,
+    print(
+        "チャットリプレイを取得しています。"
+        "長い配信では数分かかります..."
     )
-
-    ffmpeg_process = subprocess.Popen(
-        [
-            ffmpeg_path,
-            "-loglevel",
-            "warning",
-            "-i",
-            "pipe:0",
-            "-c",
-            "copy",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(segment_seconds),
-            "-reset_timestamps",
-            "1",
-            "-strftime",
-            "1",
-            str(output_dir / "video_%Y%m%d_%H%M%S.mp4"),
-        ],
-        stdin=yt_dlp_process.stdout,
-    )
-
-    # 読み手はffmpeg側に渡したので、親プロセス側の参照は閉じておく
-    # （ffmpegが終了した際にyt-dlp側もSIGPIPEで正しく終了できる）。
-    if yt_dlp_process.stdout is not None:
-        yt_dlp_process.stdout.close()
-
-    return yt_dlp_process, ffmpeg_process
-
-
-def stop_process(process: subprocess.Popen) -> None:
-    """プロセスを止める（終了済みなら何もしない）。"""
-    if process.poll() is not None:
-        return
-
-    process.terminate()
 
     try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
+        subprocess.run(command, check=True)
 
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            "取得に失敗しました。"
+            "チャットリプレイが公開されているアーカイブか"
+            "確認してください。"
+        ) from error
 
-def wait_for_chat_file(
-    video_id: str,
-    directory: Path,
-    process: subprocess.Popen,
-) -> Path:
-    """チャットファイルが作成されるまで待つ。"""
-    deadline = time.time() + FILE_APPEAR_TIMEOUT_SECONDS
+    candidates = list(
+        directory.glob(f"{video_id}.live_chat.json*")
+    )
 
-    while time.time() < deadline:
+    if not candidates:
         candidates = list(
-            directory.glob(f"{video_id}.live_chat.json*")
+            directory.glob("*.live_chat.json*")
         )
 
-        if candidates:
-            return candidates[0]
+    if not candidates:
+        raise RuntimeError(
+            "チャットリプレイがありません。"
+            "無効・削除済み・処理中の可能性があります。"
+        )
 
-        if process.poll() is not None:
-            raise RuntimeError(
-                "取得に失敗しました。"
-                "動画IDが正しいか、"
-                "チャットリプレイが公開されているか"
-                "確認してください。"
-            )
-
-        time.sleep(1)
-
-    process.terminate()
-    raise RuntimeError(
-        "チャットファイルの生成がタイムアウトしました。"
-        "yt-dlpを最新版へ更新してください。"
-    )
+    return candidates[0]
 
 
 def walk_dicts(value):
@@ -281,6 +211,29 @@ def walk_dicts(value):
     elif isinstance(value, list):
         for child in value:
             yield from walk_dicts(child)
+
+
+def iter_json_records(path: Path):
+    """改行区切りのJSONファイルを1レコードずつ読み込む。"""
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        for line_number, line in enumerate(file, 1):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                yield json.loads(line)
+
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"チャットデータの{line_number}行目を"
+                    "解析できません。"
+                    "yt-dlpを最新版へ更新してください。"
+                ) from error
 
 
 def extract_message_text(renderer: dict) -> str:
@@ -303,15 +256,9 @@ def extract_message_text(renderer: dict) -> str:
 
 
 def is_laugh_comment(message_text: str) -> bool:
-    """「w」「笑」「草」のいずれかを含むか判定する。
-
-    単純に文字列へ"w"が含まれるかどうかで判定すると、"wow"や
-    "when"、"with"のような英単語まですべて笑いコメット扱いに
-    なってしまう。そのため、前後を英字に挟まれていない"w"/"W"の
-    連続（単独の"w"や"www"、"WWW"など）だけを対象にする。
-    """
+    """「w」「笑」「草」のいずれかを含むか判定する。"""
     return (
-        bool(_LAUGH_PATTERN.search(message_text))
+        "w" in message_text.lower()
         or "笑" in message_text
         or "草" in message_text
     )
@@ -325,178 +272,166 @@ def is_cute_comment(message_text: str) -> bool:
     )
 
 
-def find_action_chunks(record):
-    """レコード内から(actionsリスト, videoOffsetTimeMsec)を列挙する。
+def count_youtube_comments(
+    path: Path,
+) -> tuple[
+    Counter[int],
+    Counter[int],
+    Counter[int],
+]:
+    """通常・笑い・かわいいコメントを1分単位で集計する。"""
+    all_counts: Counter[int] = Counter()
+    laugh_counts: Counter[int] = Counter()
+    cute_counts: Counter[int] = Counter()
 
-    アーカイブ（配信終了後のリプレイ取得）では、コメントは
-    ``replayChatItemAction`` に包まれ、動画内の経過時間を表す
-    ``videoOffsetTimeMsec`` を持つ。
+    for record in iter_json_records(path):
+        for node in walk_dicts(record):
+            replay = node.get("replayChatItemAction")
 
-    一方、放送中のライブ配信ではこの包みが無く、``actions`` が
-    直接入っており、動画内経過時間の情報を持たない。その場合は
-    offsetとして``None``を返し、呼び出し側で投稿時刻ベースの
-    集計にフォールバックする。
-    """
-    for node in walk_dicts(record):
-        replay = node.get("replayChatItemAction")
-
-        if isinstance(replay, dict):
-            actions = replay.get("actions")
-
-            if isinstance(actions, list):
-                try:
-                    offset_msec = int(
-                        replay["videoOffsetTimeMsec"]
-                    )
-                except (KeyError, TypeError, ValueError):
-                    offset_msec = None
-
-                yield actions, offset_msec
-
-            continue
-
-        # replayChatItemActionを介さず、actionsが直接
-        # 入っている（配信中によく見られる）パターン。
-        actions = node.get("actions")
-
-        if isinstance(actions, list):
-            yield actions, None
-
-
-def extract_text_renderer(action):
-    """actionから通常コメントのrendererを取り出す（無ければNone）。"""
-    if not isinstance(action, dict):
-        return None
-
-    add_action = action.get("addChatItemAction", {})
-
-    if not isinstance(add_action, dict):
-        return None
-
-    item = add_action.get("item", {})
-
-    if not isinstance(item, dict):
-        return None
-
-    renderer = item.get("liveChatTextMessageRenderer")
-
-    # Super Chatやメンバー登録通知などは除外する。
-    if not isinstance(renderer, dict):
-        return None
-
-    return renderer
-
-
-class ChatCounter:
-    """チャットファイルを差分読み込みしながら1分単位で集計する。
-
-    ファイル全体を毎回読み直す実装だと、配信が長引くほど1回の
-    更新にかかる時間が伸び、UPDATE_INTERVAL_SECONDSより処理が
-    遅くなっていく恐れがある。そのため、前回読み終えたバイト
-    位置を覚えておき、追記された分だけを読み進める。
-
-    配信中にファイルへ書き込まれている最中の行（まだ改行が
-    来ていない最終行）は次回に持ち越し、途中で切れたJSONを
-    誤って読み捨てないようにする。
-    """
-
-    def __init__(self, start_usec: int) -> None:
-        # 配信中（videoOffsetTimeMsecが無い）コメントの経過時間は、
-        # このスクリプトを起動した瞬間（起動時刻）を0分の基準にして
-        # 計算する。YouTubeの仕様上、配信中に接続した場合は配信
-        # 開始時点からの完全な履歴は取得できず、接続直後に直近の
-        # 既存コメント（バックログ）がまとめて届くことがあるため、
-        # それらは基準より前＝マイナスの分として扱う。
-        self._start_usec = start_usec
-        self._read_offset = 0
-        self.all_counts: Counter[int] = Counter()
-        self.laugh_counts: Counter[int] = Counter()
-        self.cute_counts: Counter[int] = Counter()
-
-    def _read_new_lines(self, path: Path) -> list[str]:
-        with path.open("rb") as file:
-            file.seek(self._read_offset)
-            chunk = file.read()
-
-        if not chunk:
-            return []
-
-        last_newline = chunk.rfind(b"\n")
-
-        if last_newline == -1:
-            # 改行がまだ来ていない＝行が書き込み途中。次回に回す。
-            return []
-
-        complete = chunk[: last_newline + 1]
-        self._read_offset += len(complete)
-
-        return complete.decode("utf-8", errors="ignore").splitlines()
-
-    def update(self, path: Path) -> None:
-        """新しく追記された分だけを取り込んで集計を更新する。"""
-        for line in self._read_new_lines(path):
-            line = line.strip()
-
-            if not line:
+            if not isinstance(replay, dict):
                 continue
 
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                # 通常は起きないが、念のため壊れた行は無視する。
+                offset_msec = int(
+                    replay["videoOffsetTimeMsec"]
+                )
+                minute = max(
+                    0,
+                    offset_msec // 60_000,
+                )
+
+            except (KeyError, TypeError, ValueError):
                 continue
 
-            self._consume_record(record)
-
-    def _consume_record(self, record) -> None:
-        for actions, offset_msec in find_action_chunks(record):
-            for action in actions:
-                renderer = extract_text_renderer(action)
-
-                if renderer is None:
+            for action in replay.get("actions", []):
+                if not isinstance(action, dict):
                     continue
 
-                minute = self._resolve_minute(renderer, offset_msec)
+                add_action = action.get(
+                    "addChatItemAction",
+                    {},
+                )
 
-                if minute is None:
+                if not isinstance(add_action, dict):
                     continue
 
-                message_text = extract_message_text(renderer)
+                item = add_action.get("item", {})
 
-                self.all_counts[minute] += 1
+                if not isinstance(item, dict):
+                    continue
+
+                renderer = item.get(
+                    "liveChatTextMessageRenderer"
+                )
+
+                # Super Chatやメンバー登録通知などは除外する。
+                if not isinstance(renderer, dict):
+                    continue
+
+                all_counts[minute] += 1
+
+                message_text = extract_message_text(
+                    renderer
+                )
 
                 if is_laugh_comment(message_text):
-                    self.laugh_counts[minute] += 1
+                    laugh_counts[minute] += 1
 
                 if is_cute_comment(message_text):
-                    self.cute_counts[minute] += 1
+                    cute_counts[minute] += 1
 
-    def _resolve_minute(self, renderer: dict, offset_msec: int | None):
-        if offset_msec is not None:
-            return max(0, offset_msec // 60_000)
+    if not all_counts:
+        raise RuntimeError(
+            "通常コメントを取得できません。"
+            "リプレイの有無を確認し、"
+            "yt-dlpを更新してください。"
+        )
 
-        try:
-            timestamp_usec = int(renderer.get("timestampUsec"))
-        except (TypeError, ValueError):
-            # 経過時間を判定できないコメントは集計から除外する。
-            return None
-
-        # timestampUsecはUNIX時刻（マイクロ秒）なので、起動時刻との
-        # 差分をそのまま分単位に丸める。起動前に投稿されたバックログ
-        # コメントは差分が負になり、マイナスの分として扱われる。
-        return (timestamp_usec - self._start_usec) // 60_000_000
+    return (
+        all_counts,
+        laugh_counts,
+        cute_counts,
+    )
 
 
-def format_minute_hhmm(minute: int) -> str:
-    """分（負の値も可）をH:MM形式に変換する。
+def count_twitch_comments(
+    vod_id: str,
+) -> tuple[
+    Counter[int],
+    Counter[int],
+    Counter[int],
+]:
+    """Twitchのチャットリプレイを取得し、1分単位で集計する。"""
+    try:
+        from chat_downloader import ChatDownloader
+        from chat_downloader.errors import ChatDownloaderError
 
-    0分＝起動時刻。負の値は起動前に届いたバックログコメントを表し、
-    "-"を付けて表示する。
-    """
-    sign = "-" if minute < 0 else ""
-    hours, mins = divmod(abs(minute), 60)
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "chat-downloaderがありません。"
+            "次を実行してください: "
+            "py -m pip install -U chat-downloader"
+        ) from error
 
-    return f"{sign}{hours}:{mins:02d}"
+    url = f"https://www.twitch.tv/videos/{vod_id}"
+
+    print(
+        "チャットリプレイを取得しています。"
+        "長い配信では数分かかります..."
+    )
+
+    all_counts: Counter[int] = Counter()
+    laugh_counts: Counter[int] = Counter()
+    cute_counts: Counter[int] = Counter()
+
+    try:
+        messages = ChatDownloader().get_chat(
+            url,
+            message_types=["text_message"],
+        )
+
+        for message in messages:
+            offset_seconds = message.get(
+                "time_in_seconds"
+            )
+
+            if offset_seconds is None:
+                continue
+
+            minute = max(
+                0,
+                int(offset_seconds) // 60,
+            )
+
+            message_text = message.get("message") or ""
+
+            all_counts[minute] += 1
+
+            if is_laugh_comment(message_text):
+                laugh_counts[minute] += 1
+
+            if is_cute_comment(message_text):
+                cute_counts[minute] += 1
+
+    except ChatDownloaderError as error:
+        raise RuntimeError(
+            "取得に失敗しました。"
+            "TwitchのアーカイブURLが正しいか、"
+            "チャットリプレイが利用可能か"
+            "確認してください。"
+        ) from error
+
+    if not all_counts:
+        raise RuntimeError(
+            "通常コメントを取得できません。"
+            "リプレイの有無を確認してください。"
+        )
+
+    return (
+        all_counts,
+        laugh_counts,
+        cute_counts,
+    )
 
 
 def write_csv(
@@ -506,9 +441,6 @@ def write_csv(
     cute_counts: Counter[int],
 ) -> None:
     """集計結果をCSVファイルに保存する。"""
-    if not all_counts:
-        return
-
     with path.open(
         "w",
         newline="",
@@ -526,11 +458,13 @@ def write_csv(
             ]
         )
 
-        for minute in range(min(all_counts), max(all_counts) + 1):
+        for minute in range(max(all_counts) + 1):
+            hours, mins = divmod(minute, 60)
+
             writer.writerow(
                 [
                     minute,
-                    f"{format_minute_hhmm(minute)}:00",
+                    f"{hours:02d}:{mins:02d}:00",
                     all_counts[minute],
                     laugh_counts[minute],
                     cute_counts[minute],
@@ -543,346 +477,185 @@ def format_elapsed_time(
     _position: int,
 ) -> str:
     """グラフの横軸をH:MM形式に変換する。"""
-    return format_minute_hhmm(int(round(value)))
+    minute = max(
+        0,
+        int(round(value)),
+    )
+    hours, mins = divmod(minute, 60)
+
+    return f"{hours}:{mins:02d}"
 
 
-class LiveGraph:
-    """コメント数のグラフを作成し、繰り返し更新するためのクラス。"""
-
-    def __init__(self, video_id: str):
-        self.video_id = video_id
-        self.closed = False
-
-        plt.ion()
-        self.figure, self.ax = plt.subplots(figsize=(12, 6))
-        self.figure.canvas.mpl_connect(
-            "close_event", self._on_close
-        )
-
-        # データ点が1個しかない時でも見えるよう、marker="o"を付ける。
-        (self.all_line,) = self.ax.plot(
-            [],
-            [],
-            color="#ff0033",
-            linewidth=1.2,
-            marker="o",
-            markersize=4,
-            label="All comments",
-        )
-        (self.laugh_line,) = self.ax.plot(
-            [],
-            [],
-            color="#0066ff",
-            linewidth=1.4,
-            marker="o",
-            markersize=4,
-            label='Comments containing "w", "笑", or "草"',
-        )
-        (self.cute_line,) = self.ax.plot(
-            [],
-            [],
-            color="#00a65a",
-            linewidth=1.4,
-            marker="o",
-            markersize=4,
-            label='Comments containing "かわいい" or "可愛い"',
-        )
-
-        # 起動時刻（0分）を示す縦線。マイナス側はバックログコメント。
-        self.ax.axvline(
-            0,
-            color="#888888",
-            linestyle="--",
-            linewidth=1,
-            alpha=0.7,
-            label="Script start (0:00)",
-        )
-
-        self.ax.set_ylabel("Comments")
-        self.ax.set_xlabel("Elapsed time (H:MM, 0:00 = script start)")
-        self.ax.xaxis.set_major_formatter(
-            FuncFormatter(format_elapsed_time)
-        )
-        # 縦軸は小さい値でも見やすいよう整数目盛りにする。
-        self.ax.yaxis.set_major_locator(
-            MaxNLocator(integer=True)
-        )
-        self.ax.grid(alpha=0.25)
-        self.ax.legend(loc="upper left")
-
-        # データが来る前でも軸だけは見える状態にしておく。
-        self.ax.set_xlim(0, 1)
-        self.ax.set_ylim(0, 1)
-
-        self._set_title("接続中...")
-        self.figure.tight_layout()
-
-        # show(block=False)で確実にウィンドウを画面に出す。
-        plt.show(block=False)
-        self.figure.canvas.draw()
-        plt.pause(0.1)
-
-    def _on_close(self, _event) -> None:
-        self.closed = True
-
-    def _set_title(self, status: str) -> None:
-        self.ax.set_title(
-            f"YouTube {self.video_id}\n"
-            f"Comments per minute ({status})"
-        )
-
-    def update(
-        self,
-        all_counts: Counter[int],
-        laugh_counts: Counter[int],
-        cute_counts: Counter[int],
-        status: str,
-    ) -> None:
-        if self.closed or not all_counts:
-            return
-
-        first_minute = min(all_counts)
-        last_minute = max(all_counts)
-        minutes = list(range(first_minute, last_minute + 1))
-
-        self.all_line.set_data(
-            minutes,
-            [all_counts[m] for m in minutes],
-        )
-        self.laugh_line.set_data(
-            minutes,
-            [laugh_counts[m] for m in minutes],
-        )
-        self.cute_line.set_data(
-            minutes,
-            [cute_counts[m] for m in minutes],
-        )
-
-        self._set_title(status)
-        self.ax.set_xlim(
-            min(0, first_minute),
-            max(1, last_minute),
-        )
-
-        # データがどんなに小さくても軸が潰れて見えなくならない
-        # よう、最大値に余白を持たせつつ最低限の高さを確保する。
-        max_value = max(
-            max(all_counts.values(), default=0),
-            max(laugh_counts.values(), default=0),
-            max(cute_counts.values(), default=0),
-        )
-        top = max(5, max_value * 1.2)
-        self.ax.set_ylim(0, top)
-
-        self.figure.canvas.draw_idle()
-        # flush_eventsだけでは反映されないバックエンドがあるため、
-        # 実際にGUIイベントループを回すpauseを使って強制的に描画する。
-        plt.pause(0.01)
-
-        # 軸が実際に更新されているか目視確認できるようデバッグ出力。
-        print(
-            f"[debug] x範囲={first_minute}〜{last_minute} "
-            f"y範囲={self.ax.get_ylim()} "
-            f"最大値(all/laugh/cute)="
-            f"{max(all_counts.values())}/"
-            f"{max(laugh_counts.values(), default=0)}/"
-            f"{max(cute_counts.values(), default=0)}"
-        )
-
-    def wait_final(self) -> None:
-        """配信/取得が終わった後もウィンドウを開いたままにする。
-
-        plt.show()の内部ブロック処理はバックエンドによっては
-        ion()で表示済みのウィンドウに対して正しく働かず、
-        すぐに関数が返ってスクリプトごと終了してしまうことが
-        ある。そのため、ウィンドウが閉じられるまで自前で
-        GUIイベントを回し続ける方式にしている。
-        """
-        print(
-            "グラフウィンドウを閉じるとスクリプトが終了します。"
-        )
-
-        while not self.closed:
-            try:
-                plt.pause(0.5)
-            except Exception:
-                # ウィンドウが閉じられた際に例外になる
-                # バックエンドがあるため、ここで抜ける。
-                break
-
-
-def wait_for_next_update(
-    graph: LiveGraph,
-    process: subprocess.Popen,
-    total_seconds: float,
+def show_graph(
+    source_label: str,
+    all_counts: Counter[int],
+    laugh_counts: Counter[int],
+    cute_counts: Counter[int],
 ) -> None:
-    """次の集計までの待ち時間を、短い間隔に分けて消化する。
+    """通常・笑い・かわいいコメントのグラフを表示する。"""
+    last_minute = max(all_counts)
+    minutes = list(range(last_minute + 1))
 
-    plt.pause(60)のように一度に長く待つと、その途中でウィンドウを
-    閉じても配信が終わっても、最大でその時間分だけ終了検知が
-    遅れてしまう（「閉じればすぐ終了する」という説明に反する）。
-    そのため短い間隔でポーリングし、状態が変わったら即座に
-    抜けられるようにする。
-    """
-    deadline = time.monotonic() + total_seconds
+    all_values = [
+        all_counts[minute]
+        for minute in minutes
+    ]
 
-    while (
-        time.monotonic() < deadline
-        and not graph.closed
-        and process.poll() is None
-    ):
-        plt.pause(CLOSE_CHECK_INTERVAL_SECONDS)
+    laugh_values = [
+        laugh_counts[minute]
+        for minute in minutes
+    ]
 
+    cute_values = [
+        cute_counts[minute]
+        for minute in minutes
+    ]
 
-def run(
-    video_id: str,
-    directory: Path,
-    video_output_dir: Path | None = None,
-) -> None:
-    # 「コード起動時」を0分の基準として使うため、yt-dlpを起動する
-    # 直前の時刻を記録しておく。
-    start_usec = int(time.time() * 1_000_000)
+    figure, ax = plt.subplots(figsize=(12, 6))
 
-    process = start_live_chat_capture(video_id, directory)
-    chat_path: Path | None = None
-    video_processes: tuple[subprocess.Popen, subprocess.Popen] | None = None
+    # 通常コメント全体
+    ax.plot(
+        minutes,
+        all_values,
+        color="#ff0033",
+        linewidth=1.2,
+        label="All comments",
+    )
 
-    # 映像保存の準備に失敗しても、グラフ自体は必ず表示されるように
-    # 先にウィンドウを作ってしまう。
-    graph = LiveGraph(video_id)
-    counter = ChatCounter(start_usec)
-    video_capture_warned = False
+    ax.fill_between(
+        minutes,
+        all_values,
+        color="#ff0033",
+        alpha=0.12,
+    )
 
-    try:
-        if video_output_dir is not None:
-            try:
-                video_processes = start_video_segment_capture(
-                    video_id, video_output_dir, VIDEO_SEGMENT_SECONDS
-                )
-                print(f"映像の保存先: {video_output_dir.resolve()}")
-            except (OSError, subprocess.SubprocessError) as error:
-                print(
-                    f"[警告] 映像の保存を開始できませんでした: {error}\n"
-                    "チャットの集計・グラフ表示は続行します。",
-                    file=sys.stderr,
-                )
+    # 「w」「笑」「草」を含むコメント
+    ax.plot(
+        minutes,
+        laugh_values,
+        color="#0066ff",
+        linewidth=1.4,
+        label='Comments containing "w", "笑", or "草"',
+    )
 
-        chat_path = wait_for_chat_file(
-            video_id, directory, process
-        )
+    ax.fill_between(
+        minutes,
+        laugh_values,
+        color="#0066ff",
+        alpha=0.15,
+    )
 
-        while True:
-            if (
-                video_processes is not None
-                and not video_capture_warned
-                and any(p.poll() is not None for p in video_processes)
-            ):
-                video_capture_warned = True
-                print()
-                print(
-                    "[警告] 映像の保存プロセスが停止しました。"
-                    "チャットの集計は継続します。",
-                    file=sys.stderr,
-                )
+    # 「かわいい」「可愛い」を含むコメント
+    ax.plot(
+        minutes,
+        cute_values,
+        color="#00a65a",
+        linewidth=1.4,
+        label='Comments containing "かわいい" or "可愛い"',
+    )
 
-            counter.update(chat_path)
+    ax.fill_between(
+        minutes,
+        cute_values,
+        color="#00a65a",
+        alpha=0.15,
+    )
 
-            finished = process.poll() is not None
-            status = "配信終了/取得完了" if finished else "配信中"
+    ax.set_title(
+        f"{source_label}\n"
+        "Comments per minute"
+    )
+    ax.set_ylabel("Comments")
+    ax.set_xlabel("Elapsed time (H:MM)")
 
-            graph.update(
-                counter.all_counts,
-                counter.laugh_counts,
-                counter.cute_counts,
-                status,
-            )
+    ax.xaxis.set_major_formatter(
+        FuncFormatter(format_elapsed_time)
+    )
 
-            write_csv(
-                CSV_PATH,
-                counter.all_counts,
-                counter.laugh_counts,
-                counter.cute_counts,
-            )
+    ax.set_xlim(
+        0,
+        max(1, last_minute),
+    )
+    ax.set_ylim(bottom=0)
+    ax.grid(alpha=0.25)
+    ax.legend()
 
-            if counter.all_counts:
-                print(
-                    f"[{status}] 通常コメント: "
-                    f"{sum(counter.all_counts.values())}件 / "
-                    "「w・笑・草」: "
-                    f"{sum(counter.laugh_counts.values())}件 / "
-                    "「かわいい・可愛い」: "
-                    f"{sum(counter.cute_counts.values())}件",
-                    end="\r",
-                )
-
-            if finished and process.returncode not in (0, None):
-                print()
-                print(
-                    "[警告] yt-dlpが正常終了しませんでした "
-                    f"(code={process.returncode})。"
-                    "取得できたところまでのデータを表示しています。",
-                    file=sys.stderr,
-                )
-
-            if finished or graph.closed:
-                break
-
-            # sleep()だとGUIのイベントループが止まって描画が反映
-            # されないため、pause()でGUIを動かしながら待つ。
-            # ただし一度に長く待たず、閉じた／終わったかをこまめに
-            # 確認できるよう短い間隔に分けて待つ。
-            wait_for_next_update(
-                graph, process, UPDATE_INTERVAL_SECONDS
-            )
-
-        print()
-
-        if graph.closed:
-            print("グラフのウィンドウが閉じられました。")
-        else:
-            print(f"CSV保存先: {CSV_PATH.resolve()}")
-            graph.wait_final()
-
-    finally:
-        stop_process(process)
-
-        if video_processes is not None:
-            # ffmpeg（書き込み側）を先に止め、その後にyt-dlp
-            # （パイプの送り側）を止める。
-            for video_process in reversed(video_processes):
-                stop_process(video_process)
+    figure.tight_layout()
+    plt.show()
 
 
 def main() -> int:
     """メイン処理。"""
     value = input(
-        "配信中またはアーカイブの動画IDかURLを入力してください: "
+        "アーカイブのURLまたは動画IDを入力してください"
+        "(YouTube / Twitch): "
     ).strip()
-
-    video_output_value = input(
-        "映像も保存する場合は保存先フォルダを入力"
-        "（不要な場合は空欄でEnter）: "
-    ).strip()
-    video_output_dir = (
-        Path(video_output_value) if video_output_value else None
-    )
 
     try:
-        video_id = extract_video_id(value)
+        platform = detect_platform(value)
 
-        if video_output_dir is not None:
-            find_ffmpeg()
+        if platform == "youtube":
+            video_id = extract_video_id(value)
 
-        print(f"matplotlibバックエンド: {plt.get_backend()}")
+            with tempfile.TemporaryDirectory(
+                prefix="youtube_chat_"
+            ) as temp:
+                chat_path = download_live_chat(
+                    video_id,
+                    Path(temp),
+                )
 
-        with tempfile.TemporaryDirectory(
-            prefix="youtube_chat_"
-        ) as temp:
-            run(video_id, Path(temp), video_output_dir)
+                (
+                    all_counts,
+                    laugh_counts,
+                    cute_counts,
+                ) = count_youtube_comments(chat_path)
 
-    except KeyboardInterrupt:
-        print("\n中断しました。")
-        return 1
+            source_label = f"YouTube archive {video_id}"
+
+        else:
+            video_id = extract_twitch_vod_id(value)
+
+            (
+                all_counts,
+                laugh_counts,
+                cute_counts,
+            ) = count_twitch_comments(video_id)
+
+            source_label = f"Twitch archive {video_id}"
+
+        write_csv(
+            CSV_PATH,
+            all_counts,
+            laugh_counts,
+            cute_counts,
+        )
+
+        print(
+            "通常コメント総数: "
+            f"{sum(all_counts.values())}件"
+        )
+
+        print(
+            "「w」「笑」「草」を含むコメント: "
+            f"{sum(laugh_counts.values())}件"
+        )
+
+        print(
+            "「かわいい」「可愛い」を含むコメント: "
+            f"{sum(cute_counts.values())}件"
+        )
+
+        print(
+            f"CSV保存先: {CSV_PATH.resolve()}"
+        )
+
+        show_graph(
+            source_label,
+            all_counts,
+            laugh_counts,
+            cute_counts,
+        )
 
     except (ValueError, RuntimeError) as error:
         print(
